@@ -1,0 +1,430 @@
+from scipy.sparse import dok_matrix
+from pprint import pprint
+import numpy as np
+from collections import Counter
+from random import  randint
+import os
+from datetime import datetime
+
+class Splitter(object):
+
+    def __init__(self, fileName):
+        inFile = open(fileName, 'r')
+        train = open(fileName[:-4]+"_train.txt", 'w')
+        dev = open(fileName[:-4]+"_dev.txt", 'w')
+        test = open(fileName[:-4]+"_test.txt", 'w')
+        devkey = open(fileName[:-4]+"_devkey.txt", 'w')
+        testkey = open(fileName[:-4]+"_testkey.txt", 'w')
+
+        ln = inFile.readline()
+        sentArray = list()
+        sentArray2 = list()
+        while ln:
+            lns = ln.split()
+            if len(lns)==2:
+                sentArray.append(ln)
+                sentArray2.append(lns[0]+"\n")
+            #this means that we are at the end of the sentence
+            else:
+                sentArray2.append(ln)
+                rnum = randint(0, 9)
+                if rnum<=7:
+                    writeFile = train
+                elif rnum==8:
+                    writeFile = devkey
+                    dev.write("".join(sentArray2))
+                else:
+                    writeFile = testkey
+                    test.write("".join(sentArray2))
+                writeFile.write("".join(sentArray)+"\n")
+                sentArray = list()
+                sentArray2 = list()
+            ln = inFile.readline()
+
+        inFile.close()
+        train.close()
+        dev.close()
+        test.close()
+        devkey.close()
+        testkey.close()
+
+class Eval(object):
+
+    def __init__(self, fileResults, fileKey):
+        inResults = open(fileResults, 'r')
+        inKey = open(fileKey, 'r')
+
+        lnResults = inResults.readline()
+        lnKey = inKey.readline()
+        correct = 0.0
+        total = 0.0
+        while lnKey:
+            lnsResults = lnResults.split()
+            lnsKey = lnKey.split()
+            if len(lnsKey)==2:
+                if lnsKey[1] == lnsResults[1]:
+                    correct += 1.0
+                total += 1.0
+            lnResults = inResults.readline()
+            lnKey = inKey.readline()
+
+        inResults.close()
+        inKey.close()
+        print "The total correct ("+str(correct)+") divided by the total checked ("+str(total)+") is..."
+        print "...the percent of your awesomeness: {:3.2%}!".format(correct/total)
+        if correct/total > 0.70:
+            print "Yay! Rainbows and Ponies and Sparkles!"
+        else:
+            print "Yeah...you sort of suck at Viterbi. Just saying. Go eat a cookie."
+
+class Classifier(object):
+
+    def __init__(self,algorithm="V",smoothing="L"):
+        self.wordCounter = Counter()
+        self.posCounter = Counter()
+        self.wordID = dict()
+        self.posID = dict()
+        self.wordPosMatrix = np.empty(shape=(0,0))
+        self.posPrevposMatrix = np.empty(shape=(0,0))
+        self.smoothing=smoothing
+        self.algorithm = algorithm
+
+    def train(self,fileName):
+        self.populateCounters(fileName)
+        self.populateIDs()
+        self.populateMatrices(fileName)
+        self.populateProbabilities()
+
+    def populateProbabilities(self):
+        self.wordPosProbs = np.zeros(shape=self.wordPosMatrix.shape)
+        self.posPrevposProbs = np.zeros(shape=self.posPrevposMatrix.shape)
+
+        for pos in self.posID:
+            posID = self.posID[pos]
+            for prevpos in self.posID:
+                prevposID = self.posID[prevpos]
+                self.posPrevposProbs[posID,prevposID] = self.calculateProbPosPrevpos(pos,prevpos)
+
+        for word in self.wordID:
+            wordID = self.wordID[word]
+            for pos in self.posID:
+                posID = self.posID[pos]
+                self.wordPosProbs[wordID,posID] = self.calculateProbPosWord(pos,word)
+
+    def populateCounters(self,fileName):
+        with open(fileName) as f:
+            ln = f.readline()
+            while ln:
+                lns = ln.split()
+                if len(lns) == 2:
+                    word = lns[0].lower()
+                    pos = lns[1]
+                    self.wordCounter[word] += 1
+                    self.posCounter[pos] += 1
+                ln = f.readline()
+
+    def populateIDs(self):
+        i = 1
+        self.unknowns = list()
+        for word in self.wordCounter.keys():
+            if self.wordCounter[word]==1:
+                self.unknowns.append(word)
+            else:
+                self.wordID[word] = i
+                i += 1
+        self.wordID["<UNK>"] = 0
+        self.wordCounter["<UNK>"] = len(self.unknowns)
+
+        i = 1
+        for pos in self.posCounter.keys():
+            if pos != ".":
+                self.posID[pos] = i
+                i += 1
+        self.posID["START"] = 0
+        self.posCounter["START"] = self.posCounter["."]
+        self.posID["."] = i
+
+        #make inverted dict to go from ID to POS
+        self.idPOS = {v:k for k, v in self.posID.items()}
+
+    def populateMatrices(self,fileName):
+        self.wordPosMatrix = dok_matrix(np.zeros(shape=(len(self.wordID),len(self.posID))), np.int32)
+        self.posPrevposMatrix = dok_matrix(np.zeros(shape=(len(self.posID),len(self.posID))), np.int32)
+        with open(fileName) as f:
+            ln = f.readline()
+            prevpos = self.posID["START"]
+            while ln:
+                lns = ln.split()
+                if len(lns)==2:
+                    if lns[0] in self.wordID.keys():
+                        word = self.wordID[lns[0]]
+                    else:
+                        word = self.wordID["<UNK>"]
+                    pos = self.posID[lns[1]]
+                    self.wordPosMatrix[word,pos]+=1
+                    self.posPrevposMatrix[pos,prevpos]+=1
+                    prevpos = pos
+                else:
+                    prevpos = self.posID["START"]
+                ln = f.readline()
+
+    def classifyFile(self,fileName,algorithm=None):
+        if algorithm==None:
+            algorithm = self.algorithm
+
+        if algorithm == "P":
+            classifier = self.bestPOSClassifySentence
+        elif algorithm == "W":
+            classifier = self.bestPOSForWordClassifySentence
+        elif algorithm == "J":
+            classifier = self.classifySentenceJames
+        else:
+            classifier = self.classifySentenceBook
+        self.results = list()
+        with open(fileName) as f:
+            ln = f.readline()
+            sentArray = list()
+            while ln:
+                #if there's text
+                if len(ln)>1:
+                    #-1 to get ride of newline
+                   sentArray.append(ln[:-1])
+                elif f.tell() == os.fstat(f.fileno()).st_size:
+                    sentArray.append(".")
+                    self.results.append(classifier(sentArray))
+                else:
+                    #results is a list of classified sentences (word,POS pairs)
+                    self.results.append(classifier(sentArray))
+                    sentArray = list()
+                ln = f.readline()
+            #results is a list of classified sentences (word,POS pairs)
+
+    def writeResults(self,fileName):
+        #append results to this file
+        with open(fileName,"w") as f:
+            finalResults = self.results
+            #go through list of finalResults
+            for classifiedSent in finalResults:
+                for tag in classifiedSent:
+                    word = tag[0]
+                    pos = tag[1]
+                    f.write(word+"\t"+pos+"\n")
+                f.write("\n")
+
+    def classifySentenceBook(self,sentArray):
+        'Theoretically, this is where Viterbi happens'
+        #set N to be length of state-graph and T to be length of observations
+        N = len(self.posID)
+        T = len(sentArray)
+
+        #Create path probability matrix & backpointer matrix
+        pathProbabilityMatrix = np.zeros((N,T+2),np.float32)
+        backPointerMatrix = np.zeros((N,T+2),np.int32)
+
+        #set probability of column 0 to 1.0 for start
+        pathProbabilityMatrix[self.posID["START"],0]=1.0
+
+        #for each state (POS)
+        for pos in self.posID:
+            #set s to be the number for the POS
+            s = self.posID[pos]
+
+            #viterbi[s,1] <- a0s * bs(o1)
+            pathProbabilityMatrix[s,1] = self.probPosPrevpos(pos,"START") * self.probPosWord(pos,sentArray[0])
+
+            #backpointer[s,1] <- 0
+            backPointerMatrix[s,1] = self.posID["START"]
+
+        #for each time step (word)
+        for t in range(1,T):
+           ## print sentArray[t]
+            #for each state (POS)
+            for pos in self.posID:
+                s = self.posID[pos]
+                #replace recursion with nested loop
+                thingsToMax = list()
+                thingsToArgmax = dict()
+                for prevpos in self.posID:
+                    sp = self.posID[prevpos]
+                    prevPath = pathProbabilityMatrix[sp,t]
+                    thingsToMax.append(prevPath*self.probPosPrevpos(pos,prevpos)*self.probPosWord(pos,sentArray[t]))
+                    thingsToArgmax[prevpos] = prevPath * self.probPosPrevpos(pos,prevpos)
+
+                #update pathProbabilityMatrix
+                pathProbabilityMatrix[s,t+1] = max(thingsToMax)
+
+                #update backpointer
+                backPointerMatrix[s,t+1] = self.posID[sorted(thingsToArgmax.items(),key = lambda x:x[1], reverse=True)[0][0]]
+
+        #handle last word (namely, the period at the end of sentence)
+        thingsToMax = list()
+        thingsToArgmax = dict()
+        for prevpos in self.posID:
+            s = self.posID[prevpos]
+            prevPath = pathProbabilityMatrix[s,T-1]
+            thingsToMax.append(prevPath*self.probPosPrevpos(".",prevpos))
+            thingsToArgmax[prevpos] = prevPath * self.probPosPrevpos(".",prevpos)
+
+        pathProbabilityMatrix[self.posID["."],T] = max(thingsToMax)
+        backPointerMatrix[self.posID["."],T] = self.posID[sorted(thingsToArgmax.items(),key = lambda x:x[1], reverse=True)[0][0]]
+
+        #iterate through backpointer backwards
+        path = list()
+        path.append(self.posID["."])
+        for i in range(T,1,-1):
+            path.append(backPointerMatrix[path[-1],i])
+
+        #reverse path because we want to go through it forwards
+        path.reverse()
+            
+        #make results out of path
+        results = list()
+        for i in range(len(sentArray)):
+            results.append((sentArray[i],self.idPOS[path[i]]))
+
+        print results
+
+        return results
+
+    def classifySentenceJames(self,sentArray):
+        #initialize N and T like in book
+        N = len(self.posID)
+        T = len(sentArray)
+
+        #initialize backPointerMatrix
+        backPointerMatrix = np.zeros((N,T+2),np.int32)
+
+        #Initialize pathProbabilityMatrix and set start condition
+        pathProbabilityMatrix = np.zeros((N,T+2),np.float32)
+        pathProbabilityMatrix[self.posID["START"],0]=1.0
+
+        #iterate through each word
+        for t in range(T):
+            word = sentArray[t]
+
+            #for each part of speech for each word
+            for pos in self.posID:
+                posID = self.posID[pos]
+                thingsToMax = list()
+                thingsToArgmax = dict()
+
+                #handle the fact that the first word must come from start
+                if t == 0:
+                    pathProbabilityMatrix[posID,1] = self.probPosPrevpos(pos,"START") * self.probPosWord(pos,word)
+                    backPointerMatrix[posID,1] = 0
+                
+                #handle all other words except the period
+                elif t<T:
+                    for prevpos in self.posID:
+                        prevposID = self.posID[prevpos]
+                        prevPath = pathProbabilityMatrix[prevposID,t]
+                        thingsToMax.append(prevPath*self.probPosPrevpos(pos,prevpos)*self.probPosWord(pos,word))
+                        thingsToArgmax[prevpos] = prevPath * self.probPosPrevpos(pos,prevpos)
+                    pathProbabilityMatrix[posID,t+1] = max(thingsToMax)
+                    backPointerMatrix[posID,t+1] = self.posID[sorted(thingsToArgmax.items(),key = lambda x:x[1], reverse=True)[0][0]]
+
+            #deal with the ending period
+            if t==T:
+                for prevpos in self.posID:
+                    prevposID = self.posID[prevpos]
+                    prevPath = pathProbabilityMatrix[prevposID,T-1]
+                    thingsToMax.append(prevPath*self.probPosPrevpos(".",prevpos))
+                    thingsToArgmax[prevpos] = prevPath * self.probPosPrevpos(".",prevpos)
+                pathProbabilityMatrix[N,-1] = max(thingsToMax)
+                backPointerMatrix[N,-1] = self.posID[sorted(thingsToArgmax.items(),key = lambda x:x[1], reverse=True)[0][0]]
+
+        #iterate through backpointer backwards
+        path = list()
+        path.append(self.posID["."])
+        for i in range(T,1,-1):
+            path.append(backPointerMatrix[path[-1],i])
+
+        #reverse path because we want to go through it forwards but populated it backwards
+        path.reverse()
+            
+        #make results out of path
+        results = list()
+        for i in range(len(sentArray)):
+            results.append((sentArray[i],self.idPOS[path[i]]))
+
+        #print results
+
+        return results
+
+    def bestPOSClassifySentence(self,sentArray):
+        results = list()
+        bestPos = sorted(posCounter.items(),key = lambda x:x[1], reverse=True)[0][0]
+        for word in sentArray:
+            results.append((word,bestPos))
+        return results
+
+    def bestPOSForWordClassifySentence(self,sentArray):
+        results = list()
+        for t in sentArray:
+            if t in self.wordID:
+                wordID = self.wordID[t]
+            else:
+                wordID = 0
+            posCounts = self.wordPosMatrix[wordID,:].todense().tolist()[0]
+            bestPosForWord = posCounts.index(max(posCounts))
+            results.append((t,self.idPOS[bestPosForWord]))
+        print results
+        return results
+
+    def calculateProbPosWord(self,pos,word,smoothing=None):
+        if smoothing==None:
+            smoothing = self.smoothing
+
+        if word in self.wordID.keys():
+            numProb = float(self.wordPosMatrix[self.wordID[word],self.posID[pos]])
+        else:
+            numProb = float(self.wordPosMatrix[self.wordID["<UNK>"],self.posID[pos]])
+        denomProb = self.posCounter[pos]
+        if smoothing == "L":
+            numProb += 1.0
+            denomProb += len(self.posID)
+        return numProb/denomProb
+
+    def probPosWord(self,pos,word):
+        if word not in self.wordID.keys():
+            word = "<UNK>"
+        return self.wordPosProbs[self.wordID[word],self.posID[pos]]
+
+    def probPosPrevpos(self,pos,prevpos):
+        return self.posPrevposProbs[self.posID[pos],self.posID[prevpos]]
+
+    def calculateProbPosPrevpos(self,pos,prevpos,smoothing=None):
+        if smoothing==None:
+            smoothing = self.smoothing
+
+        if smoothing == "N":
+            numProb = self.posPrevposMatrix[self.posID[pos],self.posID[prevpos]]
+            denomProb = self.posCounter[pos]
+        else:
+            numProb = self.posPrevposMatrix[self.posID[pos],self.posID[prevpos]]+1
+            denomProb = self.posCounter[pos]+len(self.posID)
+        #print pos,prevpos,numProb,denomProb,float(numProb)/float(denomProb)
+        return float(numProb)/float(denomProb)
+
+
+start = datetime.now()
+Splitter("berp-POS.txt")
+print "Splitting: {}".format((datetime.now()-start).seconds)
+
+v = Classifier("J","L")
+
+start = datetime.now()
+v.train("berp-POS_train.txt")
+print "Training: {}".format((datetime.now()-start).seconds)
+
+start = datetime.now()
+v.classifyFile("berp-POS_dev.txt")
+print "Classifying: {}".format((datetime.now()-start).seconds)
+
+start = datetime.now()
+v.writeResults("berp-POS_devresults.txt")
+print "Writing Results: {}".format((datetime.now()-start).seconds)
+
+start = datetime.now()
+Eval("berp-POS_devresults.txt", "berp-POS_devkey.txt")
+print "Evaluating: {}".format((datetime.now()-start).seconds)
